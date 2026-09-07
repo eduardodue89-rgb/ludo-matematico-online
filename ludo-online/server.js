@@ -67,7 +67,31 @@ io.on('connection',socket=>{
   socket.on('create-room',({name,maxPlayers=2}={},ack=()=>{})=>{ name=String(name||'Jugador').trim().slice(0,24)||'Jugador'; maxPlayers=Math.max(2,Math.min(4,Number(maxPlayers)||2)); const c=code(); const room={code:c,maxPlayers,started:false,host:socket.id,players:[],game:null,questions:safeQuestions(null)}; room.players.push({id:socket.id,name,color:COLORS[0],ready:true,connected:true}); rooms.set(c,room); socket.join(c); socket.data.room=c; ack({ok:true,code:c,color:COLORS[0],playerIndex:0}); broadcast(room); });
   socket.on('join-room',({name,code:c}={},ack=()=>{})=>{c=String(c||'').trim().toUpperCase();name=String(name||'Jugador').trim().slice(0,24)||'Jugador';const room=rooms.get(c);if(!room)return ack({ok:false,error:'No existe esa sala.'});if(room.started)return ack({ok:false,error:'La partida ya comenzó.'});if(room.players.length>=room.maxPlayers)return ack({ok:false,error:'La sala está llena.'});const idx=room.players.length;room.players.push({id:socket.id,name,color:COLORS[idx],ready:true,connected:true});socket.join(c);socket.data.room=c;ack({ok:true,code:c,color:COLORS[idx],playerIndex:idx});broadcast(room);});
   socket.on('start-online',({code:c,questionData}={},ack=()=>{})=>{const room=rooms.get(String(c||'').toUpperCase());if(!room)return ack({ok:false,error:'Sala no encontrada.'});if(room.host!==socket.id)return ack({ok:false,error:'Solo el creador puede iniciar la partida.'});if(room.players.length<2)return ack({ok:false,error:'Se necesitan al menos 2 jugadores.'});room.questions=safeQuestions(questionData);room.started=true;room.game=initialGame(room.players.length);io.to(room.code).emit('game-start',{state:gameState(room),players:room.players.map(x=>({name:x.name,color:x.color}))});ack({ok:true});});
-  socket.on('roll-request',({code:c}={},ack=()=>{})=>{const room=rooms.get(String(c||'').toUpperCase());if(!room||!room.started)return ack({ok:false,error:'Partida no iniciada.'});const idx=room.players.findIndex(x=>x.id===socket.id),g=room.game;if(idx!==g.current||g.awaitingMove||g.value!==null||g.winner!==null)return ack({ok:false,error:'No es tu turno.'});const n=Math.floor(Math.random()*6)+1;g.value=n;g.awaitingMove=true;io.to(room.code).emit('dice-result',{value:n,current:g.current,state:gameState(room)});ack({ok:true,value:n});});
+  socket.on('roll-request',({code:c}={},ack=()=>{})=>{
+    const room=rooms.get(String(c||'').toUpperCase());
+    if(!room||!room.started)return ack({ok:false,error:'Partida no iniciada.'});
+    const idx=room.players.findIndex(x=>x.id===socket.id),g=room.game;
+    if(idx!==g.current||g.awaitingMove||g.value!==null||g.pendingQuestion||g.winner!==null)return ack({ok:false,error:'No es tu turno.'});
+    const n=Math.floor(Math.random()*6)+1;
+    g.value=n;
+    g.awaitingMove=true;
+    const legalTokens=g.tokens[idx].filter(t=>{
+      if(t.pos<0)return n===6;
+      return t.pos<58 && t.pos+n<=58;
+    });
+    io.to(room.code).emit('dice-result',{value:n,current:g.current,noMove:legalTokens.length===0,state:gameState(room)});
+    ack({ok:true,value:n,noMove:legalTokens.length===0});
+    if(legalTokens.length===0){
+      setTimeout(()=>{
+        const r=rooms.get(room.code);
+        if(!r||!r.game||r.game.current!==idx||r.game.value!==n||!r.game.awaitingMove)return;
+        r.game.value=null;
+        r.game.awaitingMove=false;
+        r.game.current=(r.game.current+1)%r.players.length;
+        io.to(r.code).emit('game-state',{state:gameState(r),event:{type:'no-move',player:idx,dice:n,nextPlayer:r.game.current}});
+      },700);
+    }
+  });
   socket.on('move-request',({code:c,tokenIndex}={},ack=()=>{})=>{const room=rooms.get(String(c||'').toUpperCase());if(!room||!room.started)return ack({ok:false,error:'Partida no iniciada.'});const idx=room.players.findIndex(x=>x.id===socket.id),g=room.game;if(idx!==g.current||!g.awaitingMove||g.value===null||g.pendingQuestion)return ack({ok:false,error:'Movimiento no permitido.'});const ti=Number(tokenIndex),t=g.tokens[idx]?.[ti];if(!t)return ack({ok:false,error:'Ficha inválida.'});const value=g.value,old=t.pos;if(old<0&&value!==6)return ack({ok:false,error:'Necesitas un 6 para sacar una ficha.'});const next=old<0?0:old+value;if(next>58)return ack({ok:false,error:'Esa ficha no puede avanzar.'});const routeIndex=next>=0&&next<52?(STARTS[idx]+next)%52:null;const needsQuestion=next===58||(next>=0&&next<52&&!STARTS.includes(routeIndex));if(needsQuestion){const q=pickQuestion(room,t);if(q){q.oldPos=old;q.nextPos=next;q.six=value===6;q.dice=value;g.pendingQuestion=q;io.to(room.code).emit('question-request',{question:{id:q.id,q:q.q,a:q.a,image:q.image},player:idx,state:gameState(room)});return ack({ok:true,question:true});}}
 g.value=null;g.awaitingMove=false;if(next===58)g.winner=idx;if(g.winner===null&&value!==6)g.current=(g.current+1)%room.players.length;io.to(room.code).emit('game-state',{state:gameState(room),event:{type:'move',player:idx,token:ti,oldPos:old,newPos:next,dice:value,winner:g.winner}});ack({ok:true});});
   socket.on('answer-request',({code:c,questionId,answerIndex}={},ack=()=>{})=>{const room=rooms.get(String(c||'').toUpperCase());if(!room||!room.started||!room.game.pendingQuestion)return ack({ok:false,error:'No hay una pregunta pendiente.'});const idx=room.players.findIndex(x=>x.id===socket.id),q=room.game.pendingQuestion;if(idx!==q.player||String(questionId)!==String(q.id))return ack({ok:false,error:'No puedes responder esta pregunta.'});const correct=Number(answerIndex)===Number(q.ok);finishServerMove(room,idx,q.token,correct);ack({ok:true,correct});});
